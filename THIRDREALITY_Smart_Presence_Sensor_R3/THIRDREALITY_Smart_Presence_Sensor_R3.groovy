@@ -1,7 +1,11 @@
 /**
  *  THIRDREALITY Smart Presence Sensor R3 (3RPL01084Z)
  *
- *  First-pass Hubitat driver that combines:
+ *  v0.2 - Added device health watchdog (healthStatus attribute, deviceHealthCheck(),
+ *          initialize()), fixed namespace/author, stamped lastDeviceActivityMs on
+ *          every successful parse so the watchdog has a real heartbeat to track.
+ *
+ *  Combines:
  *   - RGB status light control
  *   - mmWave occupancy/presence reporting (as MotionSensor + custom occupancy attribute)
  *   - illuminance reporting
@@ -10,6 +14,7 @@
  *   - Air Quality Index deadband / minimum report interval filtering
  *   - Optional driver-side adjustable motion/presence clear timeout
  *   - Air Quality Index is treated as a whole-number value, since observed reports appear integral
+ *   - Device health watchdog: marks healthStatus offline if no Zigbee activity within threshold
  *
  *  Notes:
  *   - The presence side is exposed as MotionSensor because Hubitat apps and RM generally
@@ -17,6 +22,8 @@
  *   - Air Quality cluster 0x042E is decoded as a float/integer value and is now reported directly
  *     using the sensor's own threshold scheme from the printed instruction sheet:
  *       0-500 good, 501-1000 ventilate, 1001-3000 warning, >3000 danger.
+ *   - healthStatus transitions: unknown (fresh install/reboot) -> online (first parse) ->
+ *     offline (watchdog fires with no activity) -> online (activity resumes).
  */
 
 import groovy.transform.Field
@@ -29,7 +36,7 @@ import groovy.transform.Field
 @Field static final Integer CLUSTER_TVOC         = 0x042E
 
 metadata {
-    definition(name: "THIRDREALITY Smart Presence Sensor R3", namespace: "openai v0.15", author: "OpenAI") {
+    definition(name: "THIRDREALITY Smart Presence Sensor R3", namespace: "RonV42", author: "RonV42") {
         capability "Actuator"
         capability "Sensor"
         capability "Light"
@@ -41,11 +48,13 @@ metadata {
         capability "IlluminanceMeasurement"
         capability "Refresh"
         capability "Configuration"
+        capability "Initialize"
 
         attribute "occupancy", "enum", ["occupied", "clear"]
         attribute "AirQualityIndex", "number"
         attribute "AirQuality", "enum", ["good", "ventilate", "warning", "danger"]
         attribute "colorName", "string"
+        attribute "healthStatus", "enum", ["unknown", "online", "offline"]
 
         fingerprint profileId: "0104", endpointId: "01",
             inClusters: "0000,0003,0004,0005,0006,0008,0012,0300,0400,0406,042E,1000",
@@ -88,17 +97,35 @@ metadata {
             description: "Do not send changed Air Quality Index values more often than this, unless the Air Quality status band changes", defaultValue: 30, range: "0..3600"
         input name: "motionClearSeconds", type: "number", title: "Driver motion/presence clear timeout (seconds)",
             description: "0 = follow device clear reports only. Any value > 0 makes the driver clear motion/occupancy this many seconds after the last occupied report.", defaultValue: 0, range: "0..3600"
+        input name: "healthCheckMinutes", type: "number", title: "Health watchdog timeout (minutes)",
+            description: "Mark device offline if no Zigbee activity is received within this window. 0 = disabled.", defaultValue: 15, range: "0..60"
         input name: "logEnable", type: "bool", title: "Enable debug logging", defaultValue: true
         input name: "txtEnable", type: "bool", title: "Enable descriptionText logging", defaultValue: true
     }
 }
 
+// ── Lifecycle ─────────────────────────────────────────────────────────────────
+
 def installed() {
     log.info "installed..."
-    sendEvent(name: "motion", value: "inactive")
-    sendEvent(name: "occupancy", value: "clear")
+    sendEvent(name: "motion",       value: "inactive")
+    sendEvent(name: "occupancy",    value: "clear")
+    sendEvent(name: "healthStatus", value: "unknown")
     unschedule("syntheticMotionClear")
     scheduleAutoRefresh()
+    scheduleHealthCheck()
+}
+
+def initialize() {
+    log.info "initialize..."
+    sendEvent(name: "motion",       value: "inactive")
+    sendEvent(name: "occupancy",    value: "clear")
+    sendEvent(name: "healthStatus", value: "unknown")
+    state.lastDeviceActivityMs = null
+    unschedule()
+    scheduleAutoRefresh()
+    scheduleHealthCheck()
+    configure()
 }
 
 def updated() {
@@ -106,9 +133,11 @@ def updated() {
     log.warn "debug logging is: ${logEnable == true}"
     log.warn "description logging is: ${txtEnable == true}"
     log.warn "driver motion/presence clear timeout is: ${safeToInt(settings.motionClearSeconds, 0)} second(s)"
+    log.warn "health watchdog timeout is: ${safeToInt(settings.healthCheckMinutes, 15)} minute(s)"
     if (logEnable) runIn(1800, "logsOff")
     if (safeToInt(settings.motionClearSeconds, 0) <= 0) unschedule("syntheticMotionClear")
     scheduleAutoRefresh()
+    scheduleHealthCheck()
 }
 
 def logsOff() {
@@ -116,29 +145,63 @@ def logsOff() {
     device.updateSetting("logEnable", [value: "false", type: "bool"])
 }
 
+// ── Scheduling helpers ────────────────────────────────────────────────────────
+
 private void scheduleAutoRefresh() {
     unschedule("refresh")
     Integer mins = safeToInt(settings.autoRefreshMinutes, 0)
     switch (mins) {
-        case 1:
-            runEvery1Minute("refresh")
-            break
-        case 5:
-            runEvery5Minutes("refresh")
-            break
-        case 10:
-            runEvery10Minutes("refresh")
-            break
-        case 15:
-            runEvery15Minutes("refresh")
-            break
-        case 30:
-            runEvery30Minutes("refresh")
-            break
-        default:
-            break
+        case 1:  runEvery1Minute("refresh");   break
+        case 5:  runEvery5Minutes("refresh");  break
+        case 10: runEvery10Minutes("refresh"); break
+        case 15: runEvery15Minutes("refresh"); break
+        case 30: runEvery30Minutes("refresh"); break
+        default: break
     }
 }
+
+private void scheduleHealthCheck() {
+    unschedule("deviceHealthCheck")
+    Integer mins = safeToInt(settings.healthCheckMinutes, 15)
+    if (mins <= 0) {
+        if (logEnable) log.debug "Health watchdog disabled"
+        return
+    }
+    // Hubitat runIn takes seconds
+    runIn(mins * 60, "deviceHealthCheck")
+    if (logEnable) log.debug "Health watchdog armed for ${mins} minute(s)"
+}
+
+// ── Health watchdog ───────────────────────────────────────────────────────────
+
+def deviceHealthCheck() {
+    Integer mins = safeToInt(settings.healthCheckMinutes, 15)
+    if (mins <= 0) return
+
+    Long lastActivityMs = state.lastDeviceActivityMs != null ? (state.lastDeviceActivityMs as Long) : 0L
+    Long thresholdMs    = mins * 60000L
+    Long elapsedMs      = lastActivityMs > 0L ? (now() - lastActivityMs) : Long.MAX_VALUE
+
+    if (elapsedMs >= thresholdMs) {
+        // No activity within the watchdog window — device is silent
+        if (device.currentValue("healthStatus") != "offline") {
+            log.warn "${device.displayName} health watchdog: no Zigbee activity for ${mins} minute(s) — marking offline"
+            sendEvent(name: "healthStatus", value: "offline",
+                      descriptionText: "${device.displayName} is offline (no activity for ${mins} min)")
+        }
+        // Poke the sensor — targeted clusters only, not the full light-control refresh
+        if (logEnable) log.debug "Health watchdog firing targeted poke refresh"
+        sendHubCommand(new hubitat.device.HubMultiAction(
+            [readAttrCmd(CLUSTER_OCCUPANCY, 0x0000), "delay 500", readAttrCmd(CLUSTER_TVOC, 0x0000)],
+            hubitat.device.Protocol.ZIGBEE
+        ))
+    }
+
+    // Rearm for the next interval regardless — if the poke comes back, parse() will flip us online
+    runIn(mins * 60, "deviceHealthCheck")
+}
+
+// ── Parse ─────────────────────────────────────────────────────────────────────
 
 def parse(String description) {
     if (logEnable) log.debug "parse description: ${description}"
@@ -147,6 +210,15 @@ def parse(String description) {
     Map descMap = zigbee.parseDescriptionAsMap(description)
     if (logEnable) log.debug "descMap: ${descMap}"
     if (!descMap?.clusterInt) return
+
+    // Heartbeat — any valid cluster parse counts as device activity
+    state.lastDeviceActivityMs = now()
+    if (device.currentValue("healthStatus") != "online") {
+        sendEventIfChanged("healthStatus", "online",
+            "${device.displayName} is online", null)
+    }
+    // Rearm watchdog on every confirmed activity
+    scheduleHealthCheck()
 
     String descriptionText
     String name
@@ -220,6 +292,8 @@ def parse(String description) {
     }
 }
 
+// ── Color cluster ─────────────────────────────────────────────────────────────
+
 private Object parseColorCluster(Map descMap) {
     String descriptionText
     String name
@@ -271,6 +345,7 @@ private Object parseColorCluster(Map descMap) {
     }
 }
 
+// ── Occupancy ─────────────────────────────────────────────────────────────────
 
 private void handleOccupancyReport(Boolean occupied) {
     Integer clearSeconds = Math.max(0, safeToInt(settings.motionClearSeconds, 0))
@@ -295,8 +370,8 @@ def syntheticMotionClear() {
     if (clearSeconds <= 0) return
 
     Long lastOccupiedMs = state.lastOccupiedReportMs != null ? (state.lastOccupiedReportMs as Long) : 0L
-    Long elapsedMs = lastOccupiedMs > 0L ? (now() - lastOccupiedMs) : Long.MAX_VALUE
-    Long targetMs = clearSeconds * 1000L
+    Long elapsedMs      = lastOccupiedMs > 0L ? (now() - lastOccupiedMs) : Long.MAX_VALUE
+    Long targetMs       = clearSeconds * 1000L
 
     if (elapsedMs < targetMs) {
         Integer remainingSeconds = Math.max(1, Math.ceil((targetMs - elapsedMs) / 1000.0d) as Integer)
@@ -304,7 +379,7 @@ def syntheticMotionClear() {
         return
     }
 
-    String motionCurrent = device.currentValue("motion")?.toString()
+    String motionCurrent    = device.currentValue("motion")?.toString()
     String occupancyCurrent = device.currentValue("occupancy")?.toString()
     if (motionCurrent != "inactive" || occupancyCurrent != "clear") {
         sendEventIfChanged("motion", "inactive", "${device.displayName} motion is inactive", null)
@@ -313,14 +388,15 @@ def syntheticMotionClear() {
     }
 }
 
+// ── TVOC ──────────────────────────────────────────────────────────────────────
 
 private void handleTvocReport(Integer tvoc) {
-    Integer minDelta = Math.max(0, safeToInt(settings.tvocMinDelta, 2))
+    Integer minDelta   = Math.max(0, safeToInt(settings.tvocMinDelta, 2))
     Integer minSeconds = Math.max(0, safeToInt(settings.tvocMinSeconds, 30))
-    Long nowMs = now()
+    Long nowMs         = now()
     Integer lastReportedTvoc = state.lastReportedTvoc != null ? safeToInt(state.lastReportedTvoc, tvoc) : null
-    Long lastReportMs = state.lastTvocReportMs != null ? (state.lastTvocReportMs as Long) : 0L
-    String status = classifyTvoc(tvoc)
+    Long lastReportMs        = state.lastTvocReportMs != null ? (state.lastTvocReportMs as Long) : 0L
+    String status       = classifyTvoc(tvoc)
     String currentStatus = device.currentValue("AirQuality")?.toString()
 
     Boolean shouldSendValue = false
@@ -329,8 +405,8 @@ private void handleTvocReport(Integer tvoc) {
     } else if (currentStatus != status) {
         shouldSendValue = true
     } else {
-        Integer delta = Math.abs(tvoc - lastReportedTvoc)
-        Long elapsedMs = nowMs - lastReportMs
+        Integer delta     = Math.abs(tvoc - lastReportedTvoc)
+        Long elapsedMs    = nowMs - lastReportMs
         if (delta >= minDelta && elapsedMs >= (minSeconds * 1000L)) {
             shouldSendValue = true
         }
@@ -339,27 +415,28 @@ private void handleTvocReport(Integer tvoc) {
     sendEventIfChanged("AirQuality", status, "${device.displayName} Air Quality is ${status}", null)
 
     if (shouldSendValue) {
-        state.lastReportedTvoc = tvoc
-        state.lastTvocReportMs = nowMs
+        state.lastReportedTvoc   = tvoc
+        state.lastTvocReportMs   = nowMs
         sendEventIfChanged("AirQualityIndex", tvoc, "${device.displayName} Air Quality Index is ${tvoc} (${status})", null)
     } else if (logEnable) {
         log.debug "Filtered Air Quality Index report: ${tvoc} (${status})"
     }
 }
 
+// ── Illuminance ───────────────────────────────────────────────────────────────
 
 private void handleIlluminanceReport(Integer lux) {
-    Integer minDelta = Math.max(0, safeToInt(settings.illuminanceMinDeltaLux, 3))
+    Integer minDelta   = Math.max(0, safeToInt(settings.illuminanceMinDeltaLux, 3))
     Integer minSeconds = Math.max(0, safeToInt(settings.illuminanceMinSeconds, 30))
-    Long nowMs = now()
+    Long nowMs         = now()
     Integer lastReportedLux = state.lastReportedIlluminanceLux != null ? safeToInt(state.lastReportedIlluminanceLux, lux) : null
-    Long lastReportMs = state.lastIlluminanceReportMs != null ? (state.lastIlluminanceReportMs as Long) : 0L
+    Long lastReportMs       = state.lastIlluminanceReportMs != null ? (state.lastIlluminanceReportMs as Long) : 0L
 
     Boolean shouldSend = false
     if (lastReportedLux == null) {
         shouldSend = true
     } else {
-        Integer delta = Math.abs(lux - lastReportedLux)
+        Integer delta  = Math.abs(lux - lastReportedLux)
         Long elapsedMs = nowMs - lastReportMs
         if (delta >= minDelta) {
             shouldSend = true
@@ -370,40 +447,37 @@ private void handleIlluminanceReport(Integer lux) {
 
     if (shouldSend) {
         state.lastReportedIlluminanceLux = lux
-        state.lastIlluminanceReportMs = nowMs
+        state.lastIlluminanceReportMs    = nowMs
         sendEventIfChanged("illuminance", lux, "${device.displayName} illuminance is ${lux} Lux", "Lux")
     } else if (logEnable) {
         log.debug "Filtered illuminance report: ${lux} Lux"
     }
 }
 
+// ── TVOC decode helpers ───────────────────────────────────────────────────────
 
 private String buildTvocDebugLine(Map descMap, BigDecimal tvocValue) {
-    String hex = (descMap?.value ?: "").toString()
+    String hex       = (descMap?.value ?: "").toString()
     Integer encoding = hexToInt(descMap?.encoding, -1)
-    Float fBig = decodeFloatBigEndian(hex)
-    Float fLittle = decodeFloatLittleEndian(hex)
+    Float fBig       = decodeFloatBigEndian(hex)
+    Float fLittle    = decodeFloatLittleEndian(hex)
     Long unsignedVal = null
-    Long signedVal = null
-    try {
-        unsignedVal = parseUnsignedHex(hex)
-    } catch (ignored) { }
-    try {
-        signedVal = parseSignedHex(hex, Math.max(1, (hex?.length() ?: 0) / 2))
-    } catch (ignored) { }
-
+    Long signedVal   = null
+    try { unsignedVal = parseUnsignedHex(hex) } catch (ignored) { }
+    try { signedVal   = parseSignedHex(hex, Math.max(1, (hex?.length() ?: 0) / 2)) } catch (ignored) { }
     String status = tvocValue != null ? classifyTvoc(tvocValue.setScale(0, BigDecimal.ROUND_HALF_UP).toInteger()) : null
     return "Air Quality Index 0x042E debug: enc=${String.format('0x%02X', encoding)} hex=${hex} unsigned=${unsignedVal} signed=${signedVal} floatBE=${fBig} floatLE=${fLittle} decoded=${tvocValue} status=${status}"
 }
+
 private BigDecimal parseTvocValue(Map descMap) {
     Integer encoding = hexToInt(descMap.encoding, -1)
-    String hex = descMap.value ?: ""
+    String hex       = descMap.value ?: ""
     if (!hex) return null
 
     switch (encoding) {
         case 0x39: // single-precision float; likely ppm
-            Float f1 = decodeFloatBigEndian(hex)
-            Float f2 = decodeFloatLittleEndian(hex)
+            Float f1     = decodeFloatBigEndian(hex)
+            Float f2     = decodeFloatLittleEndian(hex)
             Float chosen = chooseReasonableFloat(f1, f2)
             if (chosen == null) return null
             return BigDecimal.valueOf(chosen as Double)
@@ -432,7 +506,7 @@ private BigDecimal parseTvocValue(Map descMap) {
 
 private static String classifyTvoc(Integer value) {
     if (value == null) return null
-    if (value <= 500) return "good"
+    if (value <= 500)  return "good"
     if (value <= 1000) return "ventilate"
     if (value <= 3000) return "warning"
     return "danger"
@@ -441,12 +515,10 @@ private static String classifyTvoc(Integer value) {
 private static Float chooseReasonableFloat(Float a, Float b) {
     List<Float> candidates = [a, b].findAll { it != null && !it.isNaN() && !it.isInfinite() && it >= 0.0f && it < 10000.0f }
     if (!candidates) return null
-
     // Prefer a practical non-subnormal value; cluster 0x042E reports on this device are arriving as
     // IEEE-754 values like 41.0 / 42.0 / 60.0, while the opposite endianness decodes to tiny near-zero noise.
     List<Float> practical = candidates.findAll { it >= 0.001f }
     if (practical) return practical.max()
-
     return candidates.max()
 }
 
@@ -454,18 +526,14 @@ private static Float decodeFloatBigEndian(String hex) {
     try {
         int bits = (int) Long.parseLong(hex, 16)
         return Float.intBitsToFloat(bits)
-    } catch (ignored) {
-        return null
-    }
+    } catch (ignored) { return null }
 }
 
 private static Float decodeFloatLittleEndian(String hex) {
     try {
         int bits = (int) Long.parseLong(hex, 16)
         return Float.intBitsToFloat(Integer.reverseBytes(bits))
-    } catch (ignored) {
-        return null
-    }
+    } catch (ignored) { return null }
 }
 
 private static Long parseUnsignedHex(String hex) {
@@ -473,11 +541,13 @@ private static Long parseUnsignedHex(String hex) {
 }
 
 private static Long parseSignedHex(String hex, Integer bytes) {
-    long unsigned = Long.parseLong(hex, 16)
-    long signBit = 1L << ((bytes * 8) - 1)
+    long unsigned  = Long.parseLong(hex, 16)
+    long signBit   = 1L << ((bytes * 8) - 1)
     long fullRange = 1L << (bytes * 8)
     return (unsigned & signBit) ? (unsigned - fullRange) : unsigned
 }
+
+// ── Color name ────────────────────────────────────────────────────────────────
 
 private void setGenericColorName() {
     Integer hue = safeToInt(device.currentValue("hue"), 0)
@@ -486,31 +556,33 @@ private void setGenericColorName() {
     String colorName
 
     switch (hue) {
-        case 0..15:   colorName = "Red"; break
-        case 16..45:  colorName = "Orange"; break
-        case 46..75:  colorName = "Yellow"; break
-        case 76..105: colorName = "Chartreuse"; break
-        case 106..135: colorName = "Green"; break
-        case 136..165: colorName = "Spring"; break
-        case 166..195: colorName = "Cyan"; break
-        case 196..225: colorName = "Azure"; break
-        case 226..255: colorName = "Blue"; break
-        case 256..285: colorName = "Violet"; break
-        case 286..315: colorName = "Magenta"; break
-        case 316..345: colorName = "Rose"; break
-        default:      colorName = "Red"; break
+        case 0..15:    colorName = "Red";        break
+        case 16..45:   colorName = "Orange";     break
+        case 46..75:   colorName = "Yellow";     break
+        case 76..105:  colorName = "Chartreuse"; break
+        case 106..135: colorName = "Green";      break
+        case 136..165: colorName = "Spring";     break
+        case 166..195: colorName = "Cyan";       break
+        case 196..225: colorName = "Azure";      break
+        case 226..255: colorName = "Blue";       break
+        case 256..285: colorName = "Violet";     break
+        case 286..315: colorName = "Magenta";    break
+        case 316..345: colorName = "Rose";       break
+        default:       colorName = "Red";        break
     }
     if (sat == 0) colorName = "White"
     sendEventIfChanged("colorName", colorName, "${device.displayName} color is ${colorName}", null)
 }
 
+// ── Light control commands ────────────────────────────────────────────────────
+
 def on() {
     if (logEnable) log.debug "on()"
     Integer transitionMs = getConfiguredTransitionMs("onTransitionTime", 1000)
-    Integer targetLevel = resolveOnLevelPercent()
-    Integer zigbeeLevel = scalePercentToZigbeeLevel(targetLevel)
-    Integer transition = transitionMsToTenths(transitionMs)
-    Integer delayMs = Math.max(400, transitionMs + 400)
+    Integer targetLevel  = resolveOnLevelPercent()
+    Integer zigbeeLevel  = scalePercentToZigbeeLevel(targetLevel)
+    Integer transition   = transitionMsToTenths(transitionMs)
+    Integer delayMs      = Math.max(400, transitionMs + 400)
 
     return [
         "he cmd 0x${device.deviceNetworkId} 0x${device.endpointId} 0x0008 4 {0x${intTo8bitUnsignedHex(zigbeeLevel)} 0x${intTo16bitUnsignedHexLE(transition)}}",
@@ -524,8 +596,8 @@ def on() {
 def off() {
     if (logEnable) log.debug "off()"
     Integer transitionMs = getConfiguredTransitionMs("offTransitionTime", 1000)
-    Integer transition = transitionMsToTenths(transitionMs)
-    Integer delayMs = Math.max(400, transitionMs + 400)
+    Integer transition   = transitionMsToTenths(transitionMs)
+    Integer delayMs      = Math.max(400, transitionMs + 400)
 
     return [
         "he cmd 0x${device.deviceNetworkId} 0x${device.endpointId} 0x0008 4 {0x00 0x${intTo16bitUnsignedHexLE(transition)}}",
@@ -538,7 +610,7 @@ def off() {
 
 def startLevelChange(direction) {
     if (logEnable) log.debug "startLevelChange(${direction})"
-    Integer upDown = direction == "down" ? 1 : 0
+    Integer upDown         = direction == "down" ? 1 : 0
     Integer unitsPerSecond = Math.max(1, safeToInt(settings.startLevelChangeRate, 100))
     return "he cmd 0x${device.deviceNetworkId} 0x${device.endpointId} 0x0008 1 { 0x${intTo8bitUnsignedHex(upDown)} 0x${intTo16bitUnsignedHexLE(unitsPerSecond)} }"
 }
@@ -559,15 +631,15 @@ def setLevel(value) {
 
 def setLevel(value, rate) {
     if (logEnable) log.debug "setLevel(${value}, ${rate})"
-    Integer requestedLevel = Math.max(0, Math.min(100, safeToInt(value, 0)))
-    Integer level = clampLevelPercent(requestedLevel)
+    Integer requestedLevel    = Math.max(0, Math.min(100, safeToInt(value, 0)))
+    Integer level             = clampLevelPercent(requestedLevel)
     BigDecimal defaultRateSeconds = getConfiguredTransitionSeconds("levelTransitionTime", 1.0G)
-    BigDecimal rateSeconds = hasMeaningfulValue(rate) ? safeToBigDecimal(rate, defaultRateSeconds) : defaultRateSeconds
+    BigDecimal rateSeconds    = hasMeaningfulValue(rate) ? safeToBigDecimal(rate, defaultRateSeconds) : defaultRateSeconds
     if (rateSeconds <= 0) rateSeconds = defaultRateSeconds > 0 ? defaultRateSeconds : 1.0G
-    Integer scaledRate = Math.max(1, (rateSeconds * 10).toInteger())
+    Integer scaledRate  = Math.max(1, (rateSeconds * 10).toInteger())
     Integer zigbeeLevel = scalePercentToZigbeeLevel(level)
-    Boolean isOn = device.currentValue("switch") == "on"
-    Integer delayMs = Math.max(400, (rateSeconds * 1000).toInteger() + 400)
+    Boolean isOn        = device.currentValue("switch") == "on"
+    Integer delayMs     = Math.max(400, (rateSeconds * 1000).toInteger() + 400)
 
     if (level > 0) state.lastNonZeroLevel = level
 
@@ -592,12 +664,12 @@ def setColor(Map value) {
     if (logEnable) log.debug "setColor(${value})"
     if (value?.hue == null || value?.saturation == null) return
 
-    Integer hueInput = safeToInt(value.hue, 0)
-    Integer satInput = safeToInt(value.saturation, 100)
+    Integer hueInput   = safeToInt(value.hue, 0)
+    Integer satInput   = safeToInt(value.saturation, 100)
     Integer levelInput = value.level != null ? clampLevelPercent(safeToInt(value.level, 100)) : null
     Integer requestedRateSeconds = value.rate != null ? safeToInt(value.rate, 0) : 0
-    Integer rateMs = requestedRateSeconds > 0 ? (requestedRateSeconds * 1000) : getConfiguredTransitionMs("rgbTransitionTime", 1000)
-    Boolean isOn = device.currentValue("switch") == "on"
+    Integer rateMs     = requestedRateSeconds > 0 ? (requestedRateSeconds * 1000) : getConfiguredTransitionMs("rgbTransitionTime", 1000)
+    Boolean isOn       = device.currentValue("switch") == "on"
 
     String hexHue = hiRezHue ?
         zigbee.convertToHexString(Math.round(hueInput / 360.0 * 254).toInteger(), 2) :
@@ -605,7 +677,7 @@ def setColor(Map value) {
     String hexSat = zigbee.convertToHexString(Math.round(satInput / 100.0 * 254).toInteger(), 2)
 
     List<String> cmds = []
-    Integer transition = transitionMsToTenths(rateMs)
+    Integer transition  = transitionMsToTenths(rateMs)
     Integer zigbeeLevel = levelInput != null ? scalePercentToZigbeeLevel(levelInput) : null
 
     if (levelInput != null && levelInput > 0) state.lastNonZeroLevel = levelInput
@@ -652,7 +724,7 @@ def setColor(Map value) {
         cmds = cmds.flatten()
     }
 
-    state.lastHue = hexHue
+    state.lastHue        = hexHue
     state.lastSaturation = hexSat
     return cmds
 }
@@ -667,16 +739,18 @@ def setSaturation(value) {
     setColor([hue: safeToInt(device.currentValue("hue"), 0), saturation: value, level: safeToInt(device.currentValue("level"), 100)])
 }
 
+// ── Refresh / Configure ───────────────────────────────────────────────────────
+
 def refresh() {
     if (logEnable) log.debug "refresh()"
     return [
-        readAttrCmd(CLUSTER_ON_OFF, 0x0000),        "delay 200",
-        readAttrCmd(CLUSTER_LEVEL, 0x0000),         "delay 200",
-        readAttrCmd(CLUSTER_COLOR, 0x0000),         "delay 200",
-        readAttrCmd(CLUSTER_COLOR, 0x0001),         "delay 200",
-        readAttrCmd(CLUSTER_ILLUMINANCE, 0x0000),   "delay 200",
-        readAttrCmd(CLUSTER_OCCUPANCY, 0x0000),     "delay 200",
-        readAttrCmd(CLUSTER_TVOC, 0x0000)
+        readAttrCmd(CLUSTER_ON_OFF,     0x0000), "delay 200",
+        readAttrCmd(CLUSTER_LEVEL,      0x0000), "delay 200",
+        readAttrCmd(CLUSTER_COLOR,      0x0000), "delay 200",
+        readAttrCmd(CLUSTER_COLOR,      0x0001), "delay 200",
+        readAttrCmd(CLUSTER_ILLUMINANCE,0x0000), "delay 200",
+        readAttrCmd(CLUSTER_OCCUPANCY,  0x0000), "delay 200",
+        readAttrCmd(CLUSTER_TVOC,       0x0000)
     ]
 }
 
@@ -688,18 +762,12 @@ def configure() {
 
     // Bind standard reporting clusters to the hub.
     cmds += [
-        "zdo bind 0x${device.deviceNetworkId} 0x${device.endpointId} 0x01 0x0006 {${device.zigbeeId}} {}",
-        "delay 200",
-        "zdo bind 0x${device.deviceNetworkId} 0x${device.endpointId} 0x01 0x0008 {${device.zigbeeId}} {}",
-        "delay 200",
-        "zdo bind 0x${device.deviceNetworkId} 0x${device.endpointId} 0x01 0x0300 {${device.zigbeeId}} {}",
-        "delay 200",
-        "zdo bind 0x${device.deviceNetworkId} 0x${device.endpointId} 0x01 0x0400 {${device.zigbeeId}} {}",
-        "delay 200",
-        "zdo bind 0x${device.deviceNetworkId} 0x${device.endpointId} 0x01 0x0406 {${device.zigbeeId}} {}",
-        "delay 200",
-        "zdo bind 0x${device.deviceNetworkId} 0x${device.endpointId} 0x01 0x042E {${device.zigbeeId}} {}",
-        "delay 200"
+        "zdo bind 0x${device.deviceNetworkId} 0x${device.endpointId} 0x01 0x0006 {${device.zigbeeId}} {}", "delay 200",
+        "zdo bind 0x${device.deviceNetworkId} 0x${device.endpointId} 0x01 0x0008 {${device.zigbeeId}} {}", "delay 200",
+        "zdo bind 0x${device.deviceNetworkId} 0x${device.endpointId} 0x01 0x0300 {${device.zigbeeId}} {}", "delay 200",
+        "zdo bind 0x${device.deviceNetworkId} 0x${device.endpointId} 0x01 0x0400 {${device.zigbeeId}} {}", "delay 200",
+        "zdo bind 0x${device.deviceNetworkId} 0x${device.endpointId} 0x01 0x0406 {${device.zigbeeId}} {}", "delay 200",
+        "zdo bind 0x${device.deviceNetworkId} 0x${device.endpointId} 0x01 0x042E {${device.zigbeeId}} {}", "delay 200"
     ]
 
     // Configure reporting where datatype is known or strongly expected.
@@ -710,13 +778,16 @@ def configure() {
     cmds += zigbee.configureReporting(CLUSTER_ILLUMINANCE, 0x0000, 0x21, 30,   300,  50)
     cmds += zigbee.configureReporting(CLUSTER_OCCUPANCY,   0x0000, 0x18, 0,    3600, 1)
 
-    // Air Quality Index is read during refresh(). I am intentionally not forcing configureReporting() on 0x042E yet,
-    // because the exact payload type/scaling from this device should be confirmed from a live 0x042E
-    // report first. Binding + refresh/auto-refresh is the safer first-pass behavior.
+    // Air Quality Index is read during refresh(). Intentionally not forcing configureReporting() on 0x042E yet;
+    // the exact payload type/scaling from this device should be confirmed from a live report first.
+    // Binding + refresh/auto-refresh is the safer first-pass behavior.
 
+    scheduleHealthCheck()
     cmds += refresh()
     return cmds
 }
+
+// ── Private helpers ───────────────────────────────────────────────────────────
 
 private Integer getConfiguredTransitionMs(String settingName, Integer defaultMs = 1000) {
     Object configured = settings?.get(settingName)
@@ -747,7 +818,7 @@ private Integer clampLevelPercent(Integer level) {
 }
 
 private Integer resolveOnLevelPercent() {
-    Integer currentLevel = safeToInt(device.currentValue("level"), 0)
+    Integer currentLevel    = safeToInt(device.currentValue("level"), 0)
     Integer rememberedLevel = safeToInt(state.lastNonZeroLevel, 100)
     Integer candidate = currentLevel > 0 ? currentLevel : (rememberedLevel > 0 ? rememberedLevel : 100)
     return clampLevelPercent(candidate)
@@ -770,7 +841,7 @@ private String readAttrCmd(Integer cluster, Integer attrId) {
 
 private Boolean sendEventIfChanged(String name, Object value, String descriptionText = null, String unit = null) {
     if (name == null) return false
-    String current = device.currentValue(name)?.toString()
+    String current  = device.currentValue(name)?.toString()
     String incoming = value?.toString()
     if (current == incoming) return false
 
