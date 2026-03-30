@@ -15,6 +15,11 @@
  *          elapsed time, and a slow drift still reports after the minimum interval.
  *        - Fixed TVOC deadband logic — same AND to OR fix for consistency.
  *
+ *  v0.4 - Removed lastSeen attribute — was spamming the event log on every parse,
+ *          burying meaningful occupancy/motion events. Hubitat's native lastActivity
+ *          timestamp (updated automatically on any sendEvent) serves the same purpose
+ *          and integrates with the Device Activity Check app natively.
+ *
  *  Combines:
  *   - RGB status light control
  *   - mmWave occupancy/presence reporting (as MotionSensor + custom occupancy attribute)
@@ -68,7 +73,6 @@ metadata {
         attribute "AirQuality",      "enum",   ["good", "ventilate", "warning", "danger"]
         attribute "colorName",       "string"
         attribute "healthStatus",    "enum",   ["unknown", "online", "offline"]
-        attribute "lastSeen",        "string"
 
         fingerprint profileId: "0104", endpointId: "01",
             inClusters: "0000,0003,0004,0005,0006,0008,0012,0300,0400,0406,042E,1000",
@@ -125,7 +129,6 @@ def installed() {
     sendEvent(name: "motion",       value: "inactive")
     sendEvent(name: "occupancy",    value: "clear")
     sendEvent(name: "healthStatus", value: "unknown")
-    sendEvent(name: "lastSeen",     value: "never")
     unschedule("syntheticMotionClear")
     scheduleAutoRefresh()
     scheduleHealthCheck()
@@ -136,7 +139,6 @@ def initialize() {
     sendEvent(name: "motion",       value: "inactive")
     sendEvent(name: "occupancy",    value: "clear")
     sendEvent(name: "healthStatus", value: "unknown")
-    sendEvent(name: "lastSeen",     value: "never")
     state.lastDeviceActivityMs = null
     unschedule()
     scheduleAutoRefresh()
@@ -226,8 +228,6 @@ def parse(String description) {
 
     // Heartbeat — any valid cluster parse counts as device activity
     state.lastDeviceActivityMs = now()
-    String nowStr = new Date().format("yyyy-MM-dd HH:mm:ss", location.timeZone)
-    sendEventIfChanged("lastSeen", nowStr, null, null)
     if (device.currentValue("healthStatus") != "online") {
         sendEventIfChanged("healthStatus", "online", "${device.displayName} is online", null)
     }
