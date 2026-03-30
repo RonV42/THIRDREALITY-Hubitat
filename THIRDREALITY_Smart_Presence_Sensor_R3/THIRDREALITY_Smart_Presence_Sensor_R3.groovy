@@ -5,6 +5,16 @@
  *          initialize()), fixed namespace/author, stamped lastDeviceActivityMs on
  *          every successful parse so the watchdog has a real heartbeat to track.
  *
+ *  v0.3 - Fixed syntheticMotionClear() — device unoccupied report now starts the
+ *          motionClearSeconds countdown rather than being ignored or passing through
+ *          immediately. Occupied report cancels any pending timer.
+ *        - Fixed AirQualityIndex unit — now reports as "ppb".
+ *        - Added lastSeen attribute — timestamp updated on every successful parse.
+ *        - Fixed illuminance deadband logic — changed AND to OR on delta/time
+ *          conditions so a significant lux change fires immediately regardless of
+ *          elapsed time, and a slow drift still reports after the minimum interval.
+ *        - Fixed TVOC deadband logic — same AND to OR fix for consistency.
+ *
  *  Combines:
  *   - RGB status light control
  *   - mmWave occupancy/presence reporting (as MotionSensor + custom occupancy attribute)
@@ -24,6 +34,9 @@
  *       0-500 good, 501-1000 ventilate, 1001-3000 warning, >3000 danger.
  *   - healthStatus transitions: unknown (fresh install/reboot) -> online (first parse) ->
  *     offline (watchdog fires with no activity) -> online (activity resumes).
+ *   - motionClearSeconds behavior: 0 = clear immediately on device unoccupied report.
+ *     Any value > 0 = device unoccupied report starts the countdown; timer firing clears
+ *     motion/occupancy. A new occupied report cancels the pending timer.
  */
 
 import groovy.transform.Field
@@ -50,11 +63,12 @@ metadata {
         capability "Configuration"
         capability "Initialize"
 
-        attribute "occupancy", "enum", ["occupied", "clear"]
+        attribute "occupancy",       "enum",   ["occupied", "clear"]
         attribute "AirQualityIndex", "number"
-        attribute "AirQuality", "enum", ["good", "ventilate", "warning", "danger"]
-        attribute "colorName", "string"
-        attribute "healthStatus", "enum", ["unknown", "online", "offline"]
+        attribute "AirQuality",      "enum",   ["good", "ventilate", "warning", "danger"]
+        attribute "colorName",       "string"
+        attribute "healthStatus",    "enum",   ["unknown", "online", "offline"]
+        attribute "lastSeen",        "string"
 
         fingerprint profileId: "0104", endpointId: "01",
             inClusters: "0000,0003,0004,0005,0006,0008,0012,0300,0400,0406,042E,1000",
@@ -88,15 +102,15 @@ metadata {
             options: [[0:"Disabled"], [1:"Every 1 minute"], [5:"Every 5 minutes"], [10:"Every 10 minutes"], [15:"Every 15 minutes"], [30:"Every 30 minutes"]],
             defaultValue: 0
         input name: "illuminanceMinDeltaLux", type: "number", title: "Illuminance deadband (Lux)",
-            description: "Ignore smaller lux changes than this amount", defaultValue: 3, range: "0..1000"
-        input name: "illuminanceMinSeconds", type: "number", title: "Minimum seconds between small illuminance reports",
-            description: "Changes smaller than the deadband are ignored until this much time has passed", defaultValue: 30, range: "0..3600"
+            description: "Report if lux changes by at least this amount OR the minimum interval has elapsed", defaultValue: 3, range: "0..1000"
+        input name: "illuminanceMinSeconds", type: "number", title: "Minimum seconds between illuminance reports",
+            description: "Report if minimum interval has elapsed OR lux changed by at least the deadband amount", defaultValue: 30, range: "0..3600"
         input name: "tvocMinDelta", type: "number", title: "Air Quality Index deadband",
-            description: "Ignore Air Quality Index changes smaller than this amount unless the Air Quality status band changes", defaultValue: 2, range: "0..10000"
+            description: "Report if AQI changes by at least this amount OR the minimum interval has elapsed (band change always reports)", defaultValue: 2, range: "0..10000"
         input name: "tvocMinSeconds", type: "number", title: "Minimum seconds between Air Quality Index reports",
-            description: "Do not send changed Air Quality Index values more often than this, unless the Air Quality status band changes", defaultValue: 30, range: "0..3600"
-        input name: "motionClearSeconds", type: "number", title: "Driver motion/presence clear timeout (seconds)",
-            description: "0 = follow device clear reports only. Any value > 0 makes the driver clear motion/occupancy this many seconds after the last occupied report.", defaultValue: 0, range: "0..3600"
+            description: "Report if minimum interval has elapsed OR AQI changed by at least the deadband amount (band change always reports)", defaultValue: 30, range: "0..3600"
+        input name: "motionClearSeconds", type: "number", title: "Motion/presence clear delay (seconds)",
+            description: "0 = clear immediately on device unoccupied report. Any value > 0 = device unoccupied report starts this countdown before clearing.", defaultValue: 0, range: "0..3600"
         input name: "healthCheckMinutes", type: "number", title: "Health watchdog timeout (minutes)",
             description: "Mark device offline if no Zigbee activity is received within this window. 0 = disabled.", defaultValue: 15, range: "0..60"
         input name: "logEnable", type: "bool", title: "Enable debug logging", defaultValue: true
@@ -111,6 +125,7 @@ def installed() {
     sendEvent(name: "motion",       value: "inactive")
     sendEvent(name: "occupancy",    value: "clear")
     sendEvent(name: "healthStatus", value: "unknown")
+    sendEvent(name: "lastSeen",     value: "never")
     unschedule("syntheticMotionClear")
     scheduleAutoRefresh()
     scheduleHealthCheck()
@@ -121,6 +136,7 @@ def initialize() {
     sendEvent(name: "motion",       value: "inactive")
     sendEvent(name: "occupancy",    value: "clear")
     sendEvent(name: "healthStatus", value: "unknown")
+    sendEvent(name: "lastSeen",     value: "never")
     state.lastDeviceActivityMs = null
     unschedule()
     scheduleAutoRefresh()
@@ -132,7 +148,7 @@ def updated() {
     log.info "updated..."
     log.warn "debug logging is: ${logEnable == true}"
     log.warn "description logging is: ${txtEnable == true}"
-    log.warn "driver motion/presence clear timeout is: ${safeToInt(settings.motionClearSeconds, 0)} second(s)"
+    log.warn "motion/presence clear delay is: ${safeToInt(settings.motionClearSeconds, 0)} second(s)"
     log.warn "health watchdog timeout is: ${safeToInt(settings.healthCheckMinutes, 15)} minute(s)"
     if (logEnable) runIn(1800, "logsOff")
     if (safeToInt(settings.motionClearSeconds, 0) <= 0) unschedule("syntheticMotionClear")
@@ -167,7 +183,6 @@ private void scheduleHealthCheck() {
         if (logEnable) log.debug "Health watchdog disabled"
         return
     }
-    // Hubitat runIn takes seconds
     runIn(mins * 60, "deviceHealthCheck")
     if (logEnable) log.debug "Health watchdog armed for ${mins} minute(s)"
 }
@@ -183,13 +198,11 @@ def deviceHealthCheck() {
     Long elapsedMs      = lastActivityMs > 0L ? (now() - lastActivityMs) : Long.MAX_VALUE
 
     if (elapsedMs >= thresholdMs) {
-        // No activity within the watchdog window — device is silent
         if (device.currentValue("healthStatus") != "offline") {
             log.warn "${device.displayName} health watchdog: no Zigbee activity for ${mins} minute(s) — marking offline"
             sendEvent(name: "healthStatus", value: "offline",
                       descriptionText: "${device.displayName} is offline (no activity for ${mins} min)")
         }
-        // Poke the sensor — targeted clusters only, not the full light-control refresh
         if (logEnable) log.debug "Health watchdog firing targeted poke refresh"
         sendHubCommand(new hubitat.device.HubMultiAction(
             [readAttrCmd(CLUSTER_OCCUPANCY, 0x0000), "delay 500", readAttrCmd(CLUSTER_TVOC, 0x0000)],
@@ -197,7 +210,7 @@ def deviceHealthCheck() {
         ))
     }
 
-    // Rearm for the next interval regardless — if the poke comes back, parse() will flip us online
+    // Rearm regardless — if poke comes back, parse() will flip us online
     runIn(mins * 60, "deviceHealthCheck")
 }
 
@@ -213,11 +226,11 @@ def parse(String description) {
 
     // Heartbeat — any valid cluster parse counts as device activity
     state.lastDeviceActivityMs = now()
+    String nowStr = new Date().format("yyyy-MM-dd HH:mm:ss", location.timeZone)
+    sendEventIfChanged("lastSeen", nowStr, null, null)
     if (device.currentValue("healthStatus") != "online") {
-        sendEventIfChanged("healthStatus", "online",
-            "${device.displayName} is online", null)
+        sendEventIfChanged("healthStatus", "online", "${device.displayName} is online", null)
     }
-    // Rearm watchdog on every confirmed activity
     scheduleHealthCheck()
 
     String descriptionText
@@ -351,41 +364,32 @@ private void handleOccupancyReport(Boolean occupied) {
     Integer clearSeconds = Math.max(0, safeToInt(settings.motionClearSeconds, 0))
 
     if (occupied) {
+        // Cancel any pending clear timer — room is occupied again
+        unschedule("syntheticMotionClear")
         sendEventIfChanged("motion", "active", "${device.displayName} motion is active", null)
         sendEventIfChanged("occupancy", "occupied", "${device.displayName} occupancy is occupied", null)
-        state.lastOccupiedReportMs = now()
-        if (clearSeconds > 0) {
-            runIn(clearSeconds, "syntheticMotionClear")
-            if (logEnable) log.debug "Scheduled synthetic motion clear in ${clearSeconds} second(s)"
-        }
+        if (logEnable) log.debug "Occupancy active — cleared any pending motion clear timer"
     } else {
-        unschedule("syntheticMotionClear")
-        sendEventIfChanged("motion", "inactive", "${device.displayName} motion is inactive", null)
-        sendEventIfChanged("occupancy", "clear", "${device.displayName} occupancy is clear", null)
+        // Device reports unoccupied
+        if (clearSeconds > 0) {
+            // Start the countdown from this moment — do NOT clear yet
+            runIn(clearSeconds, "syntheticMotionClear")
+            if (logEnable) log.debug "Device unoccupied — starting ${clearSeconds}s clear countdown"
+        } else {
+            // No delay configured — pass device clear through immediately
+            sendEventIfChanged("motion", "inactive", "${device.displayName} motion is inactive", null)
+            sendEventIfChanged("occupancy", "clear", "${device.displayName} occupancy is clear", null)
+        }
     }
 }
 
 def syntheticMotionClear() {
+    // Timer fired — clear motion and occupancy unconditionally.
+    // A new occupied report would have cancelled this timer before it could fire.
     Integer clearSeconds = Math.max(0, safeToInt(settings.motionClearSeconds, 0))
-    if (clearSeconds <= 0) return
-
-    Long lastOccupiedMs = state.lastOccupiedReportMs != null ? (state.lastOccupiedReportMs as Long) : 0L
-    Long elapsedMs      = lastOccupiedMs > 0L ? (now() - lastOccupiedMs) : Long.MAX_VALUE
-    Long targetMs       = clearSeconds * 1000L
-
-    if (elapsedMs < targetMs) {
-        Integer remainingSeconds = Math.max(1, Math.ceil((targetMs - elapsedMs) / 1000.0d) as Integer)
-        runIn(remainingSeconds, "syntheticMotionClear")
-        return
-    }
-
-    String motionCurrent    = device.currentValue("motion")?.toString()
-    String occupancyCurrent = device.currentValue("occupancy")?.toString()
-    if (motionCurrent != "inactive" || occupancyCurrent != "clear") {
-        sendEventIfChanged("motion", "inactive", "${device.displayName} motion is inactive", null)
-        sendEventIfChanged("occupancy", "clear", "${device.displayName} occupancy is clear", null)
-        if (txtEnable) log.info "${device.displayName} motion/presence was cleared by driver timeout (${clearSeconds}s)"
-    }
+    sendEventIfChanged("motion", "inactive", "${device.displayName} motion is inactive", null)
+    sendEventIfChanged("occupancy", "clear", "${device.displayName} occupancy is clear", null)
+    if (txtEnable) log.info "${device.displayName} motion/presence cleared after ${clearSeconds}s delay"
 }
 
 // ── TVOC ──────────────────────────────────────────────────────────────────────
@@ -396,18 +400,21 @@ private void handleTvocReport(Integer tvoc) {
     Long nowMs         = now()
     Integer lastReportedTvoc = state.lastReportedTvoc != null ? safeToInt(state.lastReportedTvoc, tvoc) : null
     Long lastReportMs        = state.lastTvocReportMs != null ? (state.lastTvocReportMs as Long) : 0L
-    String status       = classifyTvoc(tvoc)
+    String status        = classifyTvoc(tvoc)
     String currentStatus = device.currentValue("AirQuality")?.toString()
 
     Boolean shouldSendValue = false
     if (lastReportedTvoc == null) {
+        // First report ever — always send
         shouldSendValue = true
     } else if (currentStatus != status) {
+        // Band change — always send regardless of delta or time
         shouldSendValue = true
     } else {
-        Integer delta     = Math.abs(tvoc - lastReportedTvoc)
-        Long elapsedMs    = nowMs - lastReportMs
-        if (delta >= minDelta && elapsedMs >= (minSeconds * 1000L)) {
+        Integer delta  = Math.abs(tvoc - lastReportedTvoc)
+        Long elapsedMs = nowMs - lastReportMs
+        // OR logic: significant change fires immediately; minimum interval fires regardless of delta
+        if (delta >= minDelta || elapsedMs >= (minSeconds * 1000L)) {
             shouldSendValue = true
         }
     }
@@ -415,11 +422,11 @@ private void handleTvocReport(Integer tvoc) {
     sendEventIfChanged("AirQuality", status, "${device.displayName} Air Quality is ${status}", null)
 
     if (shouldSendValue) {
-        state.lastReportedTvoc   = tvoc
-        state.lastTvocReportMs   = nowMs
-        sendEventIfChanged("AirQualityIndex", tvoc, "${device.displayName} Air Quality Index is ${tvoc} (${status})", null)
+        state.lastReportedTvoc = tvoc
+        state.lastTvocReportMs = nowMs
+        sendEventIfChanged("AirQualityIndex", tvoc, "${device.displayName} Air Quality Index is ${tvoc} ppb (${status})", "ppb")
     } else if (logEnable) {
-        log.debug "Filtered Air Quality Index report: ${tvoc} (${status})"
+        log.debug "Filtered Air Quality Index report: ${tvoc} ppb (${status})"
     }
 }
 
@@ -434,13 +441,13 @@ private void handleIlluminanceReport(Integer lux) {
 
     Boolean shouldSend = false
     if (lastReportedLux == null) {
+        // First report ever — always send
         shouldSend = true
     } else {
         Integer delta  = Math.abs(lux - lastReportedLux)
         Long elapsedMs = nowMs - lastReportMs
-        if (delta >= minDelta) {
-            shouldSend = true
-        } else if (lux != lastReportedLux && elapsedMs >= (minSeconds * 1000L)) {
+        // OR logic: significant change fires immediately; minimum interval fires regardless of delta
+        if (delta >= minDelta || elapsedMs >= (minSeconds * 1000L)) {
             shouldSend = true
         }
     }
@@ -495,7 +502,6 @@ private BigDecimal parseTvocValue(Map descMap) {
             return BigDecimal.valueOf(parseSignedHex(hex, hex.length() / 2))
 
         default:
-            // Fall back to unsigned integer interpretation; this matches how many Hubitat descMap values appear.
             try {
                 return BigDecimal.valueOf(parseUnsignedHex(hex))
             } catch (ignored) {
@@ -744,13 +750,13 @@ def setSaturation(value) {
 def refresh() {
     if (logEnable) log.debug "refresh()"
     return [
-        readAttrCmd(CLUSTER_ON_OFF,     0x0000), "delay 200",
-        readAttrCmd(CLUSTER_LEVEL,      0x0000), "delay 200",
-        readAttrCmd(CLUSTER_COLOR,      0x0000), "delay 200",
-        readAttrCmd(CLUSTER_COLOR,      0x0001), "delay 200",
-        readAttrCmd(CLUSTER_ILLUMINANCE,0x0000), "delay 200",
-        readAttrCmd(CLUSTER_OCCUPANCY,  0x0000), "delay 200",
-        readAttrCmd(CLUSTER_TVOC,       0x0000)
+        readAttrCmd(CLUSTER_ON_OFF,      0x0000), "delay 200",
+        readAttrCmd(CLUSTER_LEVEL,       0x0000), "delay 200",
+        readAttrCmd(CLUSTER_COLOR,       0x0000), "delay 200",
+        readAttrCmd(CLUSTER_COLOR,       0x0001), "delay 200",
+        readAttrCmd(CLUSTER_ILLUMINANCE, 0x0000), "delay 200",
+        readAttrCmd(CLUSTER_OCCUPANCY,   0x0000), "delay 200",
+        readAttrCmd(CLUSTER_TVOC,        0x0000)
     ]
 }
 
@@ -760,7 +766,6 @@ def configure() {
 
     List<String> cmds = []
 
-    // Bind standard reporting clusters to the hub.
     cmds += [
         "zdo bind 0x${device.deviceNetworkId} 0x${device.endpointId} 0x01 0x0006 {${device.zigbeeId}} {}", "delay 200",
         "zdo bind 0x${device.deviceNetworkId} 0x${device.endpointId} 0x01 0x0008 {${device.zigbeeId}} {}", "delay 200",
@@ -770,17 +775,15 @@ def configure() {
         "zdo bind 0x${device.deviceNetworkId} 0x${device.endpointId} 0x01 0x042E {${device.zigbeeId}} {}", "delay 200"
     ]
 
-    // Configure reporting where datatype is known or strongly expected.
-    cmds += zigbee.configureReporting(CLUSTER_ON_OFF,      0x0000, 0x10, 0,    3600, null)
-    cmds += zigbee.configureReporting(CLUSTER_LEVEL,       0x0000, 0x20, 1,    3600, 1)
-    cmds += zigbee.configureReporting(CLUSTER_COLOR,       0x0000, 0x20, 1,    3600, 1)
-    cmds += zigbee.configureReporting(CLUSTER_COLOR,       0x0001, 0x20, 1,    3600, 1)
-    cmds += zigbee.configureReporting(CLUSTER_ILLUMINANCE, 0x0000, 0x21, 30,   300,  50)
-    cmds += zigbee.configureReporting(CLUSTER_OCCUPANCY,   0x0000, 0x18, 0,    3600, 1)
+    cmds += zigbee.configureReporting(CLUSTER_ON_OFF,      0x0000, 0x10, 0,  3600, null)
+    cmds += zigbee.configureReporting(CLUSTER_LEVEL,       0x0000, 0x20, 1,  3600, 1)
+    cmds += zigbee.configureReporting(CLUSTER_COLOR,       0x0000, 0x20, 1,  3600, 1)
+    cmds += zigbee.configureReporting(CLUSTER_COLOR,       0x0001, 0x20, 1,  3600, 1)
+    cmds += zigbee.configureReporting(CLUSTER_ILLUMINANCE, 0x0000, 0x21, 30, 300,  50)
+    cmds += zigbee.configureReporting(CLUSTER_OCCUPANCY,   0x0000, 0x18, 0,  3600, 1)
 
-    // Air Quality Index is read during refresh(). Intentionally not forcing configureReporting() on 0x042E yet;
-    // the exact payload type/scaling from this device should be confirmed from a live report first.
-    // Binding + refresh/auto-refresh is the safer first-pass behavior.
+    // 0x042E binding confirmed; configureReporting deferred until payload type/scaling
+    // is validated from live device captures.
 
     scheduleHealthCheck()
     cmds += refresh()
