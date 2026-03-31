@@ -20,6 +20,12 @@
  *          timestamp (updated automatically on any sendEvent) serves the same purpose
  *          and integrates with the Device Activity Check app natively.
  *
+ *  v0.5 - Fixed unoccupied report spam guard — device firmware sends multiple rapid
+ *          unoccupied reports which was restarting the clear countdown on every burst,
+ *          causing multiple syntheticMotionClear() firings with no preceding occupied
+ *          event. Fix: only start the countdown if occupancy is currently "occupied".
+ *          Subsequent unoccupied reports while countdown is already running are ignored.
+ *
  *  Combines:
  *   - RGB status light control
  *   - mmWave occupancy/presence reporting (as MotionSensor + custom occupancy attribute)
@@ -372,9 +378,15 @@ private void handleOccupancyReport(Boolean occupied) {
     } else {
         // Device reports unoccupied
         if (clearSeconds > 0) {
-            // Start the countdown from this moment — do NOT clear yet
-            runIn(clearSeconds, "syntheticMotionClear")
-            if (logEnable) log.debug "Device unoccupied — starting ${clearSeconds}s clear countdown"
+            // Only start the countdown if we are currently occupied — firmware sends
+            // multiple rapid unoccupied reports in a burst and we must not restart
+            // the timer on each one, which would delay the clear indefinitely.
+            if (device.currentValue("occupancy") == "occupied") {
+                runIn(clearSeconds, "syntheticMotionClear")
+                if (logEnable) log.debug "Device unoccupied — starting ${clearSeconds}s clear countdown"
+            } else {
+                if (logEnable) log.debug "Device unoccupied — countdown already running, ignoring duplicate report"
+            }
         } else {
             // No delay configured — pass device clear through immediately
             sendEventIfChanged("motion", "inactive", "${device.displayName} motion is inactive", null)
