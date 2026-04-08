@@ -19,6 +19,12 @@
  *  SOFTWARE.
  */
 
+/*  Original driver authored by Jonathan Bradshaw
+ *  Extended and maintained by Ron Vargo (RonV42) since 2025
+ *  when the Gen2 hardware introduced new cluster reporting.
+ *  Jonathan has since stepped back from active development.
+ */
+
 import groovy.transform.Field
 import hubitat.zigbee.zcl.DataType
 import java.math.RoundingMode
