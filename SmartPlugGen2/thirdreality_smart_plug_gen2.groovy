@@ -24,7 +24,7 @@ import hubitat.zigbee.zcl.DataType
 import java.math.RoundingMode
 
 metadata {
-    definition(name: 'THRIDREALITY Smart Plug Gen2',
+    definition(name: 'THIRDREALITY Smart Plug Gen2',
             importUrl: 'https://raw.githubusercontent.com/RonV42/THIRDREALITY-Hubitat/refs/heads/main/SmartPlugGen2/thirdreality_smart_plug_gen2.groovy',
             namespace: 'RonV42', author: 'Jonathan Bradshaw') {
         capability 'Actuator'
