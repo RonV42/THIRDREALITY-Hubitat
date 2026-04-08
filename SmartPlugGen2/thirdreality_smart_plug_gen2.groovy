@@ -25,6 +25,9 @@
  *  Jonathan has since stepped back from active development.
  */
 
+* version 1.03 (2023-04-22) Last known version from Jonathan Bradshaw
+* version 1.05 (2026-04-08) RonV42 Cleaned up some typos and preseving the code in github previous change was for a new cluster that wasn't handled which I sent to Jonathan in 2025
+
 import groovy.transform.Field
 import hubitat.zigbee.zcl.DataType
 import java.math.RoundingMode
