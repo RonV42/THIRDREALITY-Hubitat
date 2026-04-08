@@ -25,8 +25,8 @@ import java.math.RoundingMode
 
 metadata {
     definition(name: 'THRIDREALITY Smart Plug Gen2',
-            importUrl: 'https://raw.githubusercontent.com/bradsjm/hubitat-public/main/ThirdReality/ThirdRealityPowerMonitorPlug.groovy',
-            namespace: 'thirdreality', author: 'Jonathan Bradshaw') {
+            importUrl: 'https://raw.githubusercontent.com/RonV42/THIRDREALITY-Hubitat/refs/heads/main/SmartPlugGen2/thirdreality_smart_plug_gen2.groovy',
+            namespace: 'RonV42', author: 'Jonathan Bradshaw') {
         capability 'Actuator'
         capability 'Configuration'
         capability 'Current Meter'
@@ -801,7 +801,7 @@ private void updatePowerFactor() {
 @Field static final int METERING_UNIT_OF_MEASURE_ID = 0x0300
 @Field static final int METERING_DIVISOR_ID = 0x0302
 @Field static final int METERING_SUMMATION_FORMATTING_ID = 0x0303
-// added by RAV to handle the 0x0150 unhandled value WARN message in Hubitat log
+// added by RonV42 to handle the 0x0150 unhandled value WARN message in Hubitat log
 @Field static final int AC_POWER_FACTOR_ID = 0x0510
 
 @Field static final Map PowerRestoreOpts = [
